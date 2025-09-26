@@ -5,20 +5,20 @@ import shutil
 from pathlib import Path
 import re
 
+PROOT_DISTRO = "ubuntu"
+PROOT_RUN_DIR = "$HOME/.nexus-run"   # di dalam Ubuntu (proot)
+PROOT_BIN = "$HOME/.nexus/bin/nexus-network"
+
 # =======================
-# Util dasar
+# Util
 # =======================
 def run(cmd, env=None, print_cmd=True):
-    """Jalankan perintah shell, selalu tangkap stdout/stderr. Kembali (ok, out, err, code)."""
+    """Jalankan perintah shell, tangkap stdout/stderr. Return (ok, out, err, code)."""
     if print_cmd:
         print(f"\n>>> {cmd}")
     p = subprocess.run(
-        cmd,
-        shell=True,
-        text=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        cmd, shell=True, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     ok = (p.returncode == 0)
     if not ok:
@@ -31,14 +31,13 @@ def run(cmd, env=None, print_cmd=True):
             print(p.stderr.strip())
     return ok, (p.stdout or ""), (p.stderr or ""), p.returncode
 
-def is_command_available(cmd_name: str) -> bool:
-    return shutil.which(cmd_name) is not None
+def is_command_available(name: str) -> bool:
+    return shutil.which(name) is not None
 
 def is_termux() -> bool:
     return is_command_available("pkg")
 
 def pkg_ensure(pkgs):
-    """Pastikan paket-paket terpasang di Termux (idempotent)."""
     if not is_termux():
         return
     run("pkg update -y")
@@ -50,7 +49,6 @@ def pkg_ensure(pkgs):
             run(f"pkg install -y {p}")
 
 def append_once(file: Path, text: str):
-    """Tambahkan baris ke file rc bila belum ada (idempotent)."""
     file.parent.mkdir(parents=True, exist_ok=True)
     current = ""
     if file.exists():
@@ -67,7 +65,6 @@ def shell_rc_candidates():
     return [h / ".zshrc", h / ".bashrc", h / ".profile"]
 
 def ensure_path_to_nexus_bin():
-    """Inject ~/.nexus/bin ke PATH (rc files + proses saat ini)."""
     nexus_bin = Path.home() / ".nexus" / "bin"
     if not nexus_bin.exists():
         return False
@@ -85,7 +82,7 @@ def ensure_network():
 # Nexus CLI (native)
 # =======================
 def install_cli_termux():
-    """Coba install Nexus CLI di Termux. Jika binari tidak kompatibel, test_cli() akan mendeteksi dan kita fallback."""
+    """Coba install CLI di Termux; kalau tidak kompatibel, test_cli() akan False dan kita fallback proot."""
     if not is_termux():
         return False
     if test_cli():
@@ -107,7 +104,6 @@ def install_cli_termux():
     return False
 
 def _pick_cmd_path() -> str:
-    """Kembalikan path/command 'nexus-network' terbaik (absolute jika ada di ~/.nexus/bin)."""
     if is_command_available("nexus-network"):
         return "nexus-network"
     candidate = Path.home() / ".nexus" / "bin" / "nexus-network"
@@ -116,7 +112,7 @@ def _pick_cmd_path() -> str:
     return "nexus-network"
 
 def test_cli() -> bool:
-    """Cek apakah binari Nexus CLI *bisa dipakai* (bukan sekadar ada), hindari kasus 'Bad system call' (exit negatif)."""
+    """TRUE jika binari usable (bukan sekadar ada). Hindari kasus 'Bad system call' (exit negatif)."""
     cmd = _pick_cmd_path()
     ok, out, err, code = run(f"{cmd} --version")
     text = (out + err).lower()
@@ -127,20 +123,16 @@ def test_cli() -> bool:
 def _show_help_snippet():
     cmd = _pick_cmd_path()
     run(f"{cmd} --help")
-    # Best-effort untuk subcommand yang umum
     run(f"{cmd} start --help", print_cmd=False)
     run(f"{cmd} node start --help", print_cmd=False)
 
 def start_node_smart(node_id: str) -> bool:
-    """
-    Coba berbagai variasi perintah start. Return True jika salah satu berhasil.
-    Cetak stdout/stderr saat gagal untuk diagnosa.
-    """
+    """Coba beberapa variasi perintah start (native)."""
     ensure_path_to_nexus_bin()
     cmd_base = _pick_cmd_path()
 
     if len(node_id) < 10:
-        print(f"[?] Peringatan: node-id '{node_id}' tampak pendek. Pastikan format sesuai.")
+        print(f"[?] Peringatan: node-id '{node_id}' tampak pendek. Pastikan benar.")
 
     variants = [
         f'{cmd_base} start --node-id "{node_id}"',
@@ -160,24 +152,21 @@ def start_node_smart(node_id: str) -> bool:
         variants = [v for v in variants if "node start" in v] + [v for v in variants if "node start" not in v]
 
     for cmd in variants:
-        ok, out, err, code = run(cmd)
+        ok, out, err, _ = run(cmd)
         if ok:
             print("[✓] Node berhasil dijalankan dengan:", cmd)
             return True
-
         joined = (out + "\n" + err).lower()
-        if any(key in joined for key in ["login", "authenticate", "authorization"]):
-            print("[!] CLI tampaknya meminta autentikasi/login sebelum start. Jalankan perintah login sesuai help, lalu ulangi.")
+        if any(k in joined for k in ["login", "authenticate", "authorization"]):
+            print("[!] CLI minta login. Lihat help berikut lalu login, kemudian jalankan ulang.")
             _show_help_snippet()
-
     _show_help_snippet()
     return False
 
 # =======================
-# Fallback Ubuntu (proot)
+# PROOT (Ubuntu)
 # =======================
 def ensure_proot_distro() -> bool:
-    """Pastikan `proot-distro` ada (untuk menjalankan Ubuntu di Termux)."""
     if not is_termux():
         return False
     if is_command_available("proot-distro"):
@@ -185,38 +174,117 @@ def ensure_proot_distro() -> bool:
     pkg_ensure(["proot-distro"])
     return is_command_available("proot-distro")
 
-def start_in_proot(node_id: str):
-    """Jalankan node di dalam Ubuntu (proot-distro) — idempotent."""
+def _proot(cmd_inside: str):
+    """Jalankan perintah di dalam Ubuntu (proot)."""
+    return run(
+        f'proot-distro login {PROOT_DISTRO} -- bash -lc "{cmd_inside}"'
+    )
+
+def start_in_proot_detached(node_id: str):
+    """Start node di proot Ubuntu dalam mode detached (nohup), simpan PID & LOG."""
     if not ensure_proot_distro():
-        print("[x] proot-distro belum siap atau bukan Termux.")
+        print("[x] proot-distro belum siap / bukan Termux.")
         return
 
-    # Install Ubuntu (idempotent) & jalankan Nexus CLI di dalamnya
-    run("proot-distro install ubuntu || true")
-    run((
-        'proot-distro login ubuntu -- bash -lc "'
-        'set -e; '
-        'apt-get update -y && apt-get install -y curl ca-certificates; '
-        'curl https://cli.nexus.xyz/ | sh; '
-        'export PATH=\\"$HOME/.nexus/bin:$PATH\\"; '
-        f'nexus-network start --node-id \\"{node_id}\\""'
-    ))
+    # Install Ubuntu (idempotent) dan dependency, lalu jalankan di background
+    run(f"proot-distro install {PROOT_DISTRO} || true")
+
+    cmd = f'''
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -yq
+apt-get install -yq curl ca-certificates procps
+update-ca-certificates || true
+
+# install Nexus CLI
+curl -fsSL https://cli.nexus.xyz/ -o /tmp/nexus_install.sh
+bash /tmp/nexus_install.sh
+
+export PATH="$HOME/.nexus/bin:$PATH"
+mkdir -p {PROOT_RUN_DIR}
+
+# jalankan background + PID + LOG
+nohup {PROOT_BIN} start --node-id "{node_id}" > {PROOT_RUN_DIR}/node.log 2>&1 &
+echo $! > {PROOT_RUN_DIR}/node.pid
+
+sleep 1
+if [ -s {PROOT_RUN_DIR}/node.pid ] && ps -p $(cat {PROOT_RUN_DIR}/node.pid) >/dev/null 2>&1; then
+  echo "[✓] Node berjalan (PID $(cat {PROOT_RUN_DIR}/node.pid))."
+  echo "[i] Log: {PROOT_RUN_DIR}/node.log"
+else
+  echo "[x] Gagal menjalankan node di background. Cek log jika ada."
+  [ -f {PROOT_RUN_DIR}/node.log ] && tail -n 80 {PROOT_RUN_DIR}/node.log || true
+  exit 1
+fi
+'''
+    _proot(cmd)
+
+def proot_status():
+    """Cek status proses di proot."""
+    cmd = f'''
+PID_FILE={PROOT_RUN_DIR}/node.pid
+if [ -s "$PID_FILE" ]; then
+  PID=$(cat "$PID_FILE")
+  if ps -p "$PID" >/dev/null 2>&1; then
+    echo "STATUS: RUNNING (PID $PID)"
+  else
+    echo "STATUS: NOT RUNNING (pid file ada, proses tidak aktif)"
+  fi
+else
+  echo "STATUS: NOT RUNNING (pid file tidak ada)"
+fi
+'''
+    _proot(cmd)
+
+def proot_logs(tail_n: int = 80):
+    """Tampilkan log terakhir dari node di proot."""
+    cmd = f'''
+LOG={PROOT_RUN_DIR}/node.log
+if [ -f "$LOG" ]; then
+  echo "=== tail -n {tail_n} $LOG ==="
+  tail -n {tail_n} "$LOG"
+else
+  echo "[i] Belum ada log: $LOG"
+fi
+'''
+    _proot(cmd)
+
+def proot_stop():
+    """Hentikan node di proot (berdasarkan PID)."""
+    cmd = f'''
+PID_FILE={PROOT_RUN_DIR}/node.pid
+if [ -s "$PID_FILE" ]; then
+  PID=$(cat "$PID_FILE")
+  if ps -p "$PID" >/dev/null 2>&1; then
+    kill "$PID" || true
+    sleep 1
+    if ps -p "$PID" >/dev/null 2>&1; then
+      kill -9 "$PID" || true
+    fi
+    echo "[✓] Node dihentikan."
+  else
+    echo "[i] Proses tidak aktif. Hapus pid file."
+  fi
+  rm -f "$PID_FILE"
+else
+  echo "[i] Tidak ada pid file. Node kemungkinan tidak berjalan."
+fi
+'''
+    _proot(cmd)
 
 # =======================
-# Orkestrasi preflight
+# Preflight
 # =======================
 def preflight_ensure_ready():
     """
-    - Jika Termux: coba install CLI (boleh gagal jika binari tidak kompatibel), dan siapkan proot-distro.
-    - Jika non-Termux: cek keberadaan CLI saja.
+    Termux: coba install CLI (boleh gagal jika tidak kompatibel), siapkan proot-distro.
+    Non-Termux: cek CLI saja.
     """
     status = {"termux": is_termux(), "cli_ready": False, "proot_ready": False}
-
     if status["termux"]:
-        status["cli_ready"] = install_cli_termux()  # akan False saat kasus 'bad system call'
+        status["cli_ready"] = install_cli_termux()
         status["proot_ready"] = ensure_proot_distro()
     else:
         status["cli_ready"] = test_cli()
-
     print(f"[i] Status preflight: {status}")
     return status
