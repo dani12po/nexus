@@ -9,7 +9,7 @@ import re
 # Util dasar
 # =======================
 def run(cmd, env=None, print_cmd=True):
-    """Jalankan perintah shell, selalu tangkap stdout/stderr. Kembalikan (ok, stdout, stderr, code)."""
+    """Jalankan perintah shell, selalu tangkap stdout/stderr. Kembali (ok, out, err, code)."""
     if print_cmd:
         print(f"\n>>> {cmd}")
     p = subprocess.run(
@@ -38,11 +38,11 @@ def is_termux() -> bool:
     return is_command_available("pkg")
 
 def pkg_ensure(pkgs):
+    """Pastikan paket-paket terpasang di Termux (idempotent)."""
     if not is_termux():
         return
     run("pkg update -y")
     for p in pkgs:
-        # Jika sudah ada bin-nya, lewati
         if is_command_available(p):
             continue
         ok, *_ = run(f"dpkg -s {p} >/dev/null 2>&1", print_cmd=False)
@@ -50,6 +50,7 @@ def pkg_ensure(pkgs):
             run(f"pkg install -y {p}")
 
 def append_once(file: Path, text: str):
+    """Tambahkan baris ke file rc bila belum ada (idempotent)."""
     file.parent.mkdir(parents=True, exist_ok=True)
     current = ""
     if file.exists():
@@ -66,13 +67,13 @@ def shell_rc_candidates():
     return [h / ".zshrc", h / ".bashrc", h / ".profile"]
 
 def ensure_path_to_nexus_bin():
+    """Inject ~/.nexus/bin ke PATH (rc files + proses saat ini)."""
     nexus_bin = Path.home() / ".nexus" / "bin"
     if not nexus_bin.exists():
         return False
     export_line = 'export PATH="$HOME/.nexus/bin:$PATH"'
     for rc in shell_rc_candidates():
         append_once(rc, export_line)
-    # Terapkan ke proses saat ini juga (agar langsung terpakai)
     os.environ["PATH"] = f"{str(nexus_bin)}:" + os.environ.get("PATH", "")
     return True
 
@@ -81,9 +82,10 @@ def ensure_network():
     return ok
 
 # =======================
-# Nexus CLI
+# Nexus CLI (native)
 # =======================
 def install_cli_termux():
+    """Coba install Nexus CLI di Termux. Jika binari tidak kompatibel, test_cli() akan mendeteksi dan kita fallback."""
     if not is_termux():
         return False
     if test_cli():
@@ -104,46 +106,41 @@ def install_cli_termux():
     print("[x] Nexus CLI belum terdeteksi setelah instalasi.")
     return False
 
-def test_cli():
-    # Cek via which
-    if is_command_available("nexus-network"):
-        ok, out, _, _ = run("nexus-network --version")
-        return ok
-    # Cek di path default installer
-    candidate = Path.home() / ".nexus" / "bin" / "nexus-network"
-    if candidate.exists():
-        ok, *_ = run(f'"{candidate}" --version')
-        return ok
-    return False
-
-def _nexus_bin_cmd():
-    """Kembalikan string command untuk memanggil nexus-network (absolute jika perlu)."""
+def _pick_cmd_path() -> str:
+    """Kembalikan path/command 'nexus-network' terbaik (absolute jika ada di ~/.nexus/bin)."""
     if is_command_available("nexus-network"):
         return "nexus-network"
     candidate = Path.home() / ".nexus" / "bin" / "nexus-network"
     if candidate.exists():
         return f'"{candidate}"'
-    return "nexus-network"  # fallback, biar error ter-print jelas
+    return "nexus-network"
+
+def test_cli() -> bool:
+    """Cek apakah binari Nexus CLI *bisa dipakai* (bukan sekadar ada), hindari kasus 'Bad system call' (exit negatif)."""
+    cmd = _pick_cmd_path()
+    ok, out, err, code = run(f"{cmd} --version")
+    text = (out + err).lower()
+    if (not ok) or code < 0 or ("bad system call" in text) or ("not executable" in text):
+        return False
+    return True
 
 def _show_help_snippet():
-    cmd = _nexus_bin_cmd()
+    cmd = _pick_cmd_path()
     run(f"{cmd} --help")
-    # Coba bantuan sub-command jika ada
+    # Best-effort untuk subcommand yang umum
     run(f"{cmd} start --help", print_cmd=False)
     run(f"{cmd} node start --help", print_cmd=False)
 
 def start_node_smart(node_id: str) -> bool:
     """
-    Coba berbagai variasi perintah start. Cetak error nyata jika gagal.
-    Return True jika salah satu variasi sukses.
+    Coba berbagai variasi perintah start. Return True jika salah satu berhasil.
+    Cetak stdout/stderr saat gagal untuk diagnosa.
     """
-    env = os.environ.copy()
     ensure_path_to_nexus_bin()
-    cmd_base = _nexus_bin_cmd()
+    cmd_base = _pick_cmd_path()
 
-    # Validasi sederhana: beri peringatan jika node_id terlihat terlalu pendek
     if len(node_id) < 10:
-        print(f"[?] Peringatan: node-id '{node_id}' tampak pendek. Pastikan formatnya sesuai yang diminta CLI.")
+        print(f"[?] Peringatan: node-id '{node_id}' tampak pendek. Pastikan format sesuai.")
 
     variants = [
         f'{cmd_base} start --node-id "{node_id}"',
@@ -158,34 +155,21 @@ def start_node_smart(node_id: str) -> bool:
         f'{cmd_base} run --node_id "{node_id}"',
     ]
 
-    # Jika help menyebut pola tertentu, bisa dinaikkan prioritasnya (heuristik ringan)
-    ok_h, help_out, help_err, _ = run(f"{cmd_base} --help", print_cmd=False)
-    if ok_h:
-        if re.search(r"\bnode\s+start\b", help_out, re.IGNORECASE):
-            # Prioritaskan varian yang mengandung "node start"
-            variants = [v for v in variants if "node start" in v] + [v for v in variants if "node start" not in v]
+    ok_h, help_out, *_ = run(f"{cmd_base} --help", print_cmd=False)
+    if ok_h and re.search(r"\bnode\s+start\b", help_out, re.IGNORECASE):
+        variants = [v for v in variants if "node start" in v] + [v for v in variants if "node start" not in v]
 
-    # Eksekusi berurutan hingga satu berhasil
     for cmd in variants:
-        ok, out, err, code = run(cmd, env=env)
+        ok, out, err, code = run(cmd)
         if ok:
             print("[✓] Node berhasil dijalankan dengan:", cmd)
             return True
 
-        # Deteksi kasus umum dan beri petunjuk singkat
-        joined = f"{out}\n{err}".lower()
-        if "unknown option" in joined or "unknown flag" in joined or "unrecognized option" in joined:
-            # lanjut coba varian lain
-            continue
-        if "unknown command" in joined:
-            continue
-        if "login" in joined or "authenticate" in joined or "authorization" in joined:
-            print("[!] CLI tampaknya meminta autentikasi/login sebelum start. Coba perintah login sesuai help, lalu jalankan ulang.")
+        joined = (out + "\n" + err).lower()
+        if any(key in joined for key in ["login", "authenticate", "authorization"]):
+            print("[!] CLI tampaknya meminta autentikasi/login sebelum start. Jalankan perintah login sesuai help, lalu ulangi.")
             _show_help_snippet()
-            # tetap lanjut ke varian lain; jika tetap gagal, user sudah dapat petunjuk.
-            continue
 
-    # Semua varian gagal
     _show_help_snippet()
     return False
 
@@ -193,6 +177,7 @@ def start_node_smart(node_id: str) -> bool:
 # Fallback Ubuntu (proot)
 # =======================
 def ensure_proot_distro() -> bool:
+    """Pastikan `proot-distro` ada (untuk menjalankan Ubuntu di Termux)."""
     if not is_termux():
         return False
     if is_command_available("proot-distro"):
@@ -201,16 +186,19 @@ def ensure_proot_distro() -> bool:
     return is_command_available("proot-distro")
 
 def start_in_proot(node_id: str):
+    """Jalankan node di dalam Ubuntu (proot-distro) — idempotent."""
     if not ensure_proot_distro():
-        print("[x] proot-distro belum siap.")
+        print("[x] proot-distro belum siap atau bukan Termux.")
         return
-    # Install Ubuntu (idempotent) lalu pasang Nexus CLI di dalamnya
+
+    # Install Ubuntu (idempotent) & jalankan Nexus CLI di dalamnya
     run("proot-distro install ubuntu || true")
     run((
         'proot-distro login ubuntu -- bash -lc "'
-        'apt-get update -y && apt-get install -y curl && '
-        'curl https://cli.nexus.xyz/ | sh && '
-        f'export PATH=\\"$HOME/.nexus/bin:$PATH\\"; '
+        'set -e; '
+        'apt-get update -y && apt-get install -y curl ca-certificates; '
+        'curl https://cli.nexus.xyz/ | sh; '
+        'export PATH=\\"$HOME/.nexus/bin:$PATH\\"; '
         f'nexus-network start --node-id \\"{node_id}\\""'
     ))
 
@@ -218,10 +206,14 @@ def start_in_proot(node_id: str):
 # Orkestrasi preflight
 # =======================
 def preflight_ensure_ready():
+    """
+    - Jika Termux: coba install CLI (boleh gagal jika binari tidak kompatibel), dan siapkan proot-distro.
+    - Jika non-Termux: cek keberadaan CLI saja.
+    """
     status = {"termux": is_termux(), "cli_ready": False, "proot_ready": False}
 
-    if is_termux():
-        status["cli_ready"] = install_cli_termux()
+    if status["termux"]:
+        status["cli_ready"] = install_cli_termux()  # akan False saat kasus 'bad system call'
         status["proot_ready"] = ensure_proot_distro()
     else:
         status["cli_ready"] = test_cli()
