@@ -35,7 +35,7 @@ Mendukung **Termux (Android)** dan **Linux/macOS**.
 cd ~/nexus
 python bot.py --node-id <NODE_ID_ANDA>
 # contoh:
-# python bot.py --node-id 8404744
+# python bot.py --node-id 000000
 ```
 
 **Belum punya Node ID?** Jalankan alur daftar dari wallet:
