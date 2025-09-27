@@ -1,73 +1,125 @@
-# bot.py
-import os
-import sys
-from nexus_quick_install_termux import (
-    preflight_ensure_ready,
-    start_node_smart,
-    start_in_proot_detached,
-    proot_status,
-    proot_logs,
-    proot_stop,
-    test_cli,
-)
-
-USAGE = """\
-Pemakaian:
-  python bot.py <NODE_ID>         # start (native; fallback proot) - default
-  python bot.py --status          # cek status node di proot Ubuntu
-  python bot.py --logs [N]        # lihat N baris log terakhir (default 80)
-  python bot.py --stop            # hentikan node di proot Ubuntu
-  NODE_ID=xxxx python bot.py      # juga bisa via ENV
+#!/usr/bin/env python3
 """
+Nexus CLI Node — super-simpel wrapper
+- Mengikuti langkah resmi: curl https://cli.nexus.xyz/ | sh → start/register
+- Otomatis deteksi Termux dan jalankan via Ubuntu proot (glibc)
+- Pakai:  python bot.py --node-id <ID>
+         python bot.py --wallet <WALLET_ADDRESS>
+Opsional: --login  --status  --stop
+"""
+import os, sys, subprocess, shlex
 
-def resolve_node_id(argv) -> str:
-    # Prioritas: argumen CLI -> ENV -> input
-    if len(argv) >= 2 and not argv[1].startswith("-"):
-        return argv[1].strip()
-    env_id = os.getenv("NODE_ID", "").strip()
-    if env_id:
-        return env_id
-    return input("Masukkan node-id kamu: ").strip()
 
-def main(argv):
-    if len(argv) >= 2 and argv[1] in {"-h", "--help"}:
-        print(USAGE)
+def run(cmd: str) -> None:
+    print(f"$ {cmd}")
+    rc = subprocess.run(cmd, shell=True)
+    if rc.returncode != 0:
+        sys.exit(rc.returncode)
+
+
+def is_termux() -> bool:
+    prefix = os.environ.get("PREFIX", "")
+    return prefix.endswith("/usr") and "com.termux" in prefix
+
+
+def start_nexus_linux(node_id=None, wallet=None, login=False, status=False, stop=False):
+    home = os.path.expanduser("~")
+    nn = os.path.join(home, ".nexus", "bin", "nexus-network")
+
+    # Pastikan CLI terpasang (sesuai docs resmi)
+    if not os.path.isfile(nn):
+        run("curl https://cli.nexus.xyz/ | sh")
+
+    if login:
+        run(f"{shlex.quote(nn)} login --no-open")
+        return
+    if status:
+        run(f"{shlex.quote(nn)} status || {shlex.quote(nn)} ps || {shlex.quote(nn)} --version")
+        return
+    if stop:
+        run(f"{shlex.quote(nn)} stop || true")
         return
 
-    # Subcommand ringan
-    if len(argv) >= 2 and argv[1] == "--status":
-        proot_status()
-        return
-    if len(argv) >= 2 and argv[1] == "--logs":
-        tail_n = 80
-        if len(argv) >= 3 and argv[2].isdigit():
-            tail_n = int(argv[2])
-        proot_logs(tail_n)
-        return
-    if len(argv) >= 2 and argv[1] == "--stop":
-        proot_stop()
-        return
+    if node_id:
+        run(f"{shlex.quote(nn)} start --node-id {shlex.quote(node_id)}")
+    elif wallet:
+        run(f"{shlex.quote(nn)} register-user --wallet-address {shlex.quote(wallet)}")
+        run(f"{shlex.quote(nn)} register-node")
+        run(f"{shlex.quote(nn)} start")
+    else:
+        print("Usage: python bot.py --node-id <ID>  |  --wallet <WALLET_ADDRESS>\nOpsional: --login, --status, --stop")
+        sys.exit(2)
 
-    print("=== Menjalankan Nexus Node via bot.py (auto-check & auto-install) ===")
 
-    # Preflight env (idempotent)
-    _ = preflight_ensure_ready()
+def start_nexus_termux(node_id=None, wallet=None, login=False, status=False, stop=False):
+    # Persiapan Termux → Ubuntu proot
+    run("pkg update -y && pkg install -y proot-distro curl")
+    run("proot-distro install ubuntu || true")
 
-    node_id = resolve_node_id(argv)
-    if not node_id:
-        print("[!] Node-id kosong.\n")
-        print(USAGE)
-        return
+    inner_lines = [
+        "set -e",
+        "apt-get update -y && apt-get install -y curl ca-certificates",
+        "curl https://cli.nexus.xyz/ | sh",
+        "echo 'export PATH=\"$HOME/.nexus/bin:$PATH\"' >> ~/.bashrc",
+        ". ~/.bashrc",
+    ]
 
-    # 1) Coba native; jika gagal atau tidak kompatibel, fallback proot (DETACHED)
-    if test_cli():
-        ok = start_node_smart(node_id)
-        if ok:
-            return
-        print("[!] Start native gagal; fallback via Ubuntu (proot-distro)...")
+    if login:
+        inner_lines.append("$HOME/.nexus/bin/nexus-network login --no-open")
+    elif status:
+        inner_lines.append("$HOME/.nexus/bin/nexus-network status || $HOME/.nexus/bin/nexus-network ps || $HOME/.nexus/bin/nexus-network --version")
+    elif stop:
+        inner_lines.append("$HOME/.nexus/bin/nexus-network stop || true")
+    elif node_id:
+        inner_lines.append(f"$HOME/.nexus/bin/nexus-network start --node-id {shlex.quote(node_id)}")
+    elif wallet:
+        inner_lines.append(f"$HOME/.nexus/bin/nexus-network register-user --wallet-address {shlex.quote(wallet)}")
+        inner_lines.append("$HOME/.nexus/bin/nexus-network register-node")
+        inner_lines.append("$HOME/.nexus/bin/nexus-network start")
+    else:
+        inner_lines.append('echo "Set --node-id <ID> atau --wallet <ADDR>" && exit 2')
 
-    # 2) Jalankan di proot Ubuntu (DETACHED + PID + LOG)
-    start_in_proot_detached(node_id)
+    inner_script = "\n".join(inner_lines)
+    cmd = "proot-distro login ubuntu -- bash -lc " + shlex.quote(inner_script)
+    run(cmd)
+
+
+def parse_args(argv):
+    node_id = None
+    wallet = None
+    login = False
+    status = False
+    stop = False
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--node-id" and i + 1 < len(argv):
+            node_id = argv[i + 1]
+            i += 1
+        elif a == "--wallet" and i + 1 < len(argv):
+            wallet = argv[i + 1]
+            i += 1
+        elif a == "--login":
+            login = True
+        elif a == "--status":
+            status = True
+        elif a == "--stop":
+            stop = True
+        else:
+            print(f"Unknown arg: {a}")
+            sys.exit(2)
+        i += 1
+
+    # Fallback dari env var
+    node_id = node_id or os.getenv("NODE_ID")
+    wallet = wallet or os.getenv("WALLET_ADDRESS")
+    return node_id, wallet, login, status, stop
+
 
 if __name__ == "__main__":
-    main(sys.argv)
+    node_id, wallet, login, status, stop = parse_args(sys.argv[1:])
+    if is_termux():
+        start_nexus_termux(node_id, wallet, login, status, stop)
+    else:
+        start_nexus_linux(node_id, wallet, login, status, stop)
