@@ -1,16 +1,5 @@
-# nexus_quick_install_termux.py (update 2025-11)
-"""Helper buat jalanin Nexus CLI di Termux (native / Ubuntu proot).
-
-Bisa di-import dari bot.py ATAU dijalankan langsung:
-
-  python nexus_quick_install_termux.py preflight
-  python nexus_quick_install_termux.py start --node-id <ID>
-  python nexus_quick_install_termux.py status
-  python nexus_quick_install_termux.py logs
-  python nexus_quick_install_termux.py stop
-"""
+# nexus_quick_install_termux.py
 import os
-import sys
 import subprocess
 import shutil
 from pathlib import Path
@@ -19,7 +8,6 @@ import re
 PROOT_DISTRO = "ubuntu"
 PROOT_RUN_DIR = "$HOME/.nexus-run"   # di dalam Ubuntu (proot)
 PROOT_BIN = "$HOME/.nexus/bin/nexus-network"
-
 
 # =======================
 # Util
@@ -43,14 +31,11 @@ def run(cmd, env=None, print_cmd=True):
             print(p.stderr.strip())
     return ok, (p.stdout or ""), (p.stderr or ""), p.returncode
 
-
 def is_command_available(name: str) -> bool:
     return shutil.which(name) is not None
 
-
 def is_termux() -> bool:
     return is_command_available("pkg")
-
 
 def pkg_ensure(pkgs):
     if not is_termux():
@@ -62,7 +47,6 @@ def pkg_ensure(pkgs):
         ok, *_ = run(f"dpkg -s {p} >/dev/null 2>&1", print_cmd=False)
         if not ok:
             run(f"pkg install -y {p}")
-
 
 def append_once(file: Path, text: str):
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -76,11 +60,9 @@ def append_once(file: Path, text: str):
         with file.open("a", encoding="utf-8") as f:
             f.write("\n" + text.rstrip() + "\n")
 
-
 def shell_rc_candidates():
     h = Path.home()
     return [h / ".zshrc", h / ".bashrc", h / ".profile"]
-
 
 def ensure_path_to_nexus_bin():
     nexus_bin = Path.home() / ".nexus" / "bin"
@@ -92,11 +74,9 @@ def ensure_path_to_nexus_bin():
     os.environ["PATH"] = f"{str(nexus_bin)}:" + os.environ.get("PATH", "")
     return True
 
-
 def ensure_network():
     ok, *_ = run("curl -sSfI https://cli.nexus.xyz", print_cmd=False)
     return ok
-
 
 # =======================
 # Nexus CLI (native)
@@ -123,7 +103,6 @@ def install_cli_termux():
     print("[x] Nexus CLI belum terdeteksi setelah instalasi.")
     return False
 
-
 def _pick_cmd_path() -> str:
     if is_command_available("nexus-network"):
         return "nexus-network"
@@ -132,23 +111,20 @@ def _pick_cmd_path() -> str:
         return f'"{candidate}"'
     return "nexus-network"
 
-
 def test_cli() -> bool:
-    """TRUE jika binari usable (bukan sekadar ada). Hindari kasus 'Bad system call'."""
+    """TRUE jika binari usable (bukan sekadar ada). Hindari kasus 'Bad system call' (exit negatif)."""
     cmd = _pick_cmd_path()
-    ok, out, err, code = run(f"{cmd} --version", print_cmd=False)
+    ok, out, err, code = run(f"{cmd} --version")
     text = (out + err).lower()
     if (not ok) or code < 0 or ("bad system call" in text) or ("not executable" in text):
         return False
     return True
 
-
 def _show_help_snippet():
     cmd = _pick_cmd_path()
-    run(f"{cmd} --help", print_cmd=False)
+    run(f"{cmd} --help")
     run(f"{cmd} start --help", print_cmd=False)
     run(f"{cmd} node start --help", print_cmd=False)
-
 
 def start_node_smart(node_id: str) -> bool:
     """Coba beberapa variasi perintah start (native)."""
@@ -187,7 +163,6 @@ def start_node_smart(node_id: str) -> bool:
     _show_help_snippet()
     return False
 
-
 # =======================
 # PROOT (Ubuntu)
 # =======================
@@ -199,13 +174,11 @@ def ensure_proot_distro() -> bool:
     pkg_ensure(["proot-distro"])
     return is_command_available("proot-distro")
 
-
 def _proot(cmd_inside: str):
     """Jalankan perintah di dalam Ubuntu (proot)."""
     return run(
         f'proot-distro login {PROOT_DISTRO} -- bash -lc "{cmd_inside}"'
     )
-
 
 def start_in_proot_detached(node_id: str):
     """Start node di proot Ubuntu dalam mode detached (nohup), simpan PID & LOG."""
@@ -246,7 +219,6 @@ fi
 '''
     _proot(cmd)
 
-
 def proot_status():
     """Cek status proses di proot."""
     cmd = f'''
@@ -264,7 +236,6 @@ fi
 '''
     _proot(cmd)
 
-
 def proot_logs(tail_n: int = 80):
     """Tampilkan log terakhir dari node di proot."""
     cmd = f'''
@@ -277,7 +248,6 @@ else
 fi
 '''
     _proot(cmd)
-
 
 def proot_stop():
     """Hentikan node di proot (berdasarkan PID)."""
@@ -302,12 +272,14 @@ fi
 '''
     _proot(cmd)
 
-
 # =======================
 # Preflight
 # =======================
 def preflight_ensure_ready():
-    """Termux: coba install CLI (boleh gagal), siapkan proot-distro. Non-Termux: cek CLI saja."""
+    """
+    Termux: coba install CLI (boleh gagal jika tidak kompatibel), siapkan proot-distro.
+    Non-Termux: cek CLI saja.
+    """
     status = {"termux": is_termux(), "cli_ready": False, "proot_ready": False}
     if status["termux"]:
         status["cli_ready"] = install_cli_termux()
@@ -316,85 +288,3 @@ def preflight_ensure_ready():
         status["cli_ready"] = test_cli()
     print(f"[i] Status preflight: {status}")
     return status
-
-
-# =======================
-# CLI entrypoint (optional)
-# =======================
-def _parse_cli(argv=None):
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Helper Nexus CLI untuk Termux (native + Ubuntu proot)"
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_pref = sub.add_parser("preflight", help="Cek & siapkan environment saja")
-    p_pref.set_defaults(cmd="preflight")
-
-    p_start = sub.add_parser("start", help="Start node dengan node-id (native/proot)")
-    p_start.add_argument("--node-id", required=True, help="Node ID dari dashboard Nexus")
-    p_start.set_defaults(cmd="start")
-
-    p_status = sub.add_parser("status", help="Cek status node (proot/native)")
-    p_status.set_defaults(cmd="status")
-
-    p_logs = sub.add_parser("logs", help="Tail log node (proot)")
-    p_logs.add_argument("--lines", type=int, default=80, help="Jumlah baris log (default: 80)")
-    p_logs.set_defaults(cmd="logs")
-
-    p_stop = sub.add_parser("stop", help="Stop node (proot/native)")
-    p_stop.set_defaults(cmd="stop")
-
-    return parser.parse_args(argv)
-
-
-def _main_cli(argv=None):
-    args = _parse_cli(argv)
-    status = preflight_ensure_ready()
-    termux = status["termux"]
-    cli_ready = status["cli_ready"]
-    proot_ready = status["proot_ready"]
-
-    if args.cmd == "preflight":
-        # sudah di-print di preflight_ensure_ready()
-        return
-
-    if args.cmd == "start":
-        node_id = args.node_id
-        if termux and not cli_ready and proot_ready:
-            start_in_proot_detached(node_id)
-            return
-        # coba native dulu
-        ok = start_node_smart(node_id)
-        if not ok and termux and proot_ready:
-            print("[i] Fallback ke Ubuntu proot ...")
-            start_in_proot_detached(node_id)
-        return
-
-    if args.cmd == "status":
-        if termux and proot_ready:
-            proot_status()
-        else:
-            cmd = _pick_cmd_path()
-            run(f"{cmd} status || {cmd} ps || {cmd} --version")
-        return
-
-    if args.cmd == "logs":
-        if termux and proot_ready:
-            proot_logs(args.lines)
-        else:
-            print("[i] Logs hanya didukung otomatis untuk mode proot di Termux.")
-        return
-
-    if args.cmd == "stop":
-        if termux and proot_ready:
-            proot_stop()
-        else:
-            cmd = _pick_cmd_path()
-            run(f"{cmd} stop || true")
-        return
-
-
-if __name__ == "__main__":
-    _main_cli(sys.argv[1:])
